@@ -231,6 +231,48 @@ void BindFeatureMatching(py::module& m) {
           "Match features between two images. Keypoints are optional. "
           "Returns an Nx2 matrix of point2D indices.")
       .def(
+          "match_with_cameras",
+          [](FeatureMatcher& self,
+             image_t image_id1,
+             const FeatureKeypoints& keypoints1,
+             std::shared_ptr<const FeatureDescriptors> descriptors1,
+             const Camera& camera1,
+             image_t image_id2,
+             const FeatureKeypoints& keypoints2,
+             std::shared_ptr<const FeatureDescriptors> descriptors2,
+             const Camera& camera2) {
+            FeatureMatcher::Image image1;
+            image1.image_id = image_id1;
+            image1.camera = &camera1;
+            image1.keypoints =
+                std::shared_ptr<const FeatureKeypoints>(
+                    std::shared_ptr<void>(), &keypoints1);
+            image1.descriptors = std::move(descriptors1);
+
+            FeatureMatcher::Image image2;
+            image2.image_id = image_id2;
+            image2.camera = &camera2;
+            image2.keypoints =
+                std::shared_ptr<const FeatureKeypoints>(
+                    std::shared_ptr<void>(), &keypoints2);
+            image2.descriptors = std::move(descriptors2);
+
+            FeatureMatches matches;
+            self.Match(image1, image2, &matches);
+
+            return MatchesToMatrix(matches);
+          },
+          "image_id1"_a,
+          "keypoints1"_a,
+          "descriptors1"_a,
+          "camera1"_a,
+          "image_id2"_a,
+          "keypoints2"_a,
+          "descriptors2"_a,
+          "camera2"_a,
+          "Match two images with camera information and image IDs. "
+          "Returns an Nx2 matrix of point2D indices.")
+      .def(
           "match_guided",
           [](FeatureMatcher& self,
              double max_error,

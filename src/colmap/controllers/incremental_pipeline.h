@@ -63,9 +63,8 @@ struct IncrementalPipelineOptions {
   int max_model_overlap = 20;
 
   // The minimum number of registered images of a sub-model, otherwise the
-  // sub-model is discarded. Note that the first sub-model is always kept
-  // independent of size. If the model contains at least half of the total
-  // number of images, we also always keep it.
+  // sub-model is discarded. If the model contains at least half of the total
+  // number of images, the minimum model size is adjusted accordingly.
   int min_model_size = 10;
 
   // The image identifiers used to initialize the reconstruction. Note that

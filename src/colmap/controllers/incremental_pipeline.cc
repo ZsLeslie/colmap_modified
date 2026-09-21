@@ -209,7 +209,7 @@ BundleAdjustmentOptions IncrementalPipelineOptions::GlobalBundleAdjustment()
       options.ceres->solver_options.logging_type =
           ceres::LoggingType::PER_MINIMIZER_ITERATION;
     }
-    options.ceres->solver_options.num_threads = num_threads;
+    options.ceres->solver_options.num_threads = 4;
 #if CERES_VERSION_MAJOR < 2
     options.ceres->solver_options.num_linear_solver_threads = num_threads;
 #endif  // CERES_VERSION_MAJOR
@@ -219,6 +219,9 @@ BundleAdjustmentOptions IncrementalPipelineOptions::GlobalBundleAdjustment()
         CeresBundleAdjustmentOptions::LossFunctionType::TRIVIAL;
     options.ceres->use_gpu = ba_use_gpu;
     options.ceres->gpu_index = ba_gpu_index;
+    options.ceres->min_num_images_gpu_solver = 50;
+    options.ceres->max_num_images_direct_dense_gpu_solver = 49;
+    options.ceres->max_num_images_direct_sparse_gpu_solver = 4000;
   }
   return options;
 }
@@ -699,8 +702,7 @@ IncrementalPipeline::Status IncrementalPipeline::Reconstruct(
         const size_t total_num_reg_images = mapper.NumTotalRegImages();
 
         // Always keep the first reconstruction, independent of size.
-        if ((options_->multiple_models && reconstruction_manager_->Size() > 1 &&
-             num_reg_images < static_cast<size_t>(options_->min_model_size)) ||
+        if ((options_->multiple_models && num_reg_images < static_cast<size_t>(options_->min_model_size)) ||
             num_reg_images == 0) {
           LOG(WARNING) << "Discarding reconstruction due to insufficient size";
           mapper.EndReconstruction(/*discard=*/true);

@@ -192,7 +192,7 @@ class BruteForceONNXFeatureMatcher : public FeatureMatcher {
  private:
   struct Features {
     image_t image_id = kInvalidImageId;
-    std::vector<float> descriptors_data;
+    std::shared_ptr<const FeatureDescriptors> descriptors;
     std::vector<int64_t> descriptors_shape;
   };
 
@@ -208,28 +208,28 @@ class BruteForceONNXFeatureMatcher : public FeatureMatcher {
     const int num_keypoints = image.descriptors->data.rows();
     const int descriptor_dim = image.descriptors->data.cols() / sizeof(float);
     THROW_CHECK_GT(descriptor_dim, 0);
+    THROW_CHECK_EQ(image.descriptors->data.size(),
+                   num_keypoints * descriptor_dim * sizeof(float));
 
     Features features;
     features.image_id = image.image_id;
+    features.descriptors = image.descriptors;
     features.descriptors_shape = {num_keypoints, descriptor_dim};
-    features.descriptors_data.resize(num_keypoints * descriptor_dim);
-    THROW_CHECK_EQ(image.descriptors->data.size(),
-                   features.descriptors_data.size() * sizeof(float));
-    std::memcpy(features.descriptors_data.data(),
-                reinterpret_cast<const void*>(image.descriptors->data.data()),
-                image.descriptors->data.size());
 
     return features;
   }
 
   Ort::Value CreateDescriptorTensor(Features& features) {
-    return Ort::Value::CreateTensor<float>(
+    THROW_CHECK_NOTNULL(features.descriptors);
+    const FeatureDescriptorsData& descriptors = features.descriptors->data;
+    return Ort::Value::CreateTensor(
         Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtDeviceAllocator,
                                    OrtMemType::OrtMemTypeCPU),
-        features.descriptors_data.data(),
-        features.descriptors_data.size(),
+        const_cast<uint8_t*>(descriptors.data()),
+        descriptors.size(),
         features.descriptors_shape.data(),
-        features.descriptors_shape.size());
+        features.descriptors_shape.size(),
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
   }
 
   const FeatureMatchingOptions options_;
@@ -363,21 +363,8 @@ class LightGlueONNXFeatureMatcher : public FeatureMatcher {
         prev_features2_.keypoints_shape.data(),
         prev_features2_.keypoints_shape.size()));
 
-    input_tensors.emplace_back(Ort::Value::CreateTensor<float>(
-        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtDeviceAllocator,
-                                   OrtMemType::OrtMemTypeCPU),
-        prev_features1_.descriptors_data.data(),
-        prev_features1_.descriptors_data.size(),
-        prev_features1_.descriptors_shape.data(),
-        prev_features1_.descriptors_shape.size()));
-
-    input_tensors.emplace_back(Ort::Value::CreateTensor<float>(
-        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtDeviceAllocator,
-                                   OrtMemType::OrtMemTypeCPU),
-        prev_features2_.descriptors_data.data(),
-        prev_features2_.descriptors_data.size(),
-        prev_features2_.descriptors_shape.data(),
-        prev_features2_.descriptors_shape.size()));
+    input_tensors.emplace_back(CreateDescriptorTensor(prev_features1_));
+    input_tensors.emplace_back(CreateDescriptorTensor(prev_features2_));
 
     std::vector<int64_t> image_size_shape = {1, 2};
     input_tensors.emplace_back(Ort::Value::CreateTensor<float>(
@@ -488,7 +475,11 @@ class LightGlueONNXFeatureMatcher : public FeatureMatcher {
     image_t image_id = kInvalidImageId;
     std::vector<float> keypoints_data;
     std::vector<int64_t> keypoints_shape;
-    std::vector<float> descriptors_data;
+    // ALIKED descriptors are already float32 values stored as bytes, so keep
+    // their shared storage instead of making another full copy. SIFT needs a
+    // converted and normalized float matrix owned by this cache.
+    std::shared_ptr<const FeatureDescriptors> descriptors;
+    FeatureDescriptorsFloatData converted_descriptors_data;
     std::vector<int64_t> descriptors_shape;
     float image_size[2];
     std::vector<float> scales_data;
@@ -530,39 +521,41 @@ class LightGlueONNXFeatureMatcher : public FeatureMatcher {
     const int image_width = image.camera->width;
     const int image_height = image.camera->height;
 
-    std::vector<FeatureKeypoint> rotated_keypoints;
-    const FeatureKeypoints* keypoints_to_use = image.keypoints.get();
-    if (rot90 != 0) {
-      rotated_keypoints = *image.keypoints;
-      for (auto& kp : rotated_keypoints) {
-        kp.Rot90(rot90, image_width, image_height);
-      }
-      keypoints_to_use = &rotated_keypoints;
-    }
-
     // Convert keypoints: COLMAP (origin at pixel corner, top-left center =
     // (0.5, 0.5)) to LightGlue (top-left center = (0, 0)).
     features.keypoints_shape = {1, num_keypoints, 2};
     features.keypoints_data.resize(num_keypoints * 2);
+    if (is_sift) {
+      features.scales_shape = {1, num_keypoints};
+      features.scales_data.resize(num_keypoints);
+      features.orientations_shape = {1, num_keypoints};
+      features.orientations_data.resize(num_keypoints);
+    }
     for (int i = 0; i < num_keypoints; ++i) {
-      const FeatureKeypoint& kp = (*keypoints_to_use)[i];
+      FeatureKeypoint kp = (*image.keypoints)[i];
+      if (rot90 != 0) {
+        kp.Rot90(rot90, image_width, image_height);
+      }
       features.keypoints_data[2 * i + 0] = kp.x - 0.5f;
       features.keypoints_data[2 * i + 1] = kp.y - 0.5f;
+      if (is_sift) {
+        features.scales_data[i] = kp.ComputeScale();
+        // LightGlue was trained with radians.
+        features.orientations_data[i] = kp.ComputeOrientation();
+      }
     }
 
     if (is_aliked) {
-      // ALIKED descriptors: stored as float bytes, reinterpret directly.
+      // ALIKED descriptors are stored as float bytes. The untyped ONNX tensor
+      // API can use this existing buffer directly without a float32 copy.
       THROW_CHECK_EQ(image.descriptors->data.cols() % sizeof(float), 0);
       const int descriptor_dim = image.descriptors->data.cols() / sizeof(float);
       THROW_CHECK_GT(descriptor_dim, 0);
+      THROW_CHECK_EQ(image.descriptors->data.size(),
+                     num_keypoints * descriptor_dim * sizeof(float));
 
       features.descriptors_shape = {1, num_keypoints, descriptor_dim};
-      features.descriptors_data.resize(num_keypoints * descriptor_dim);
-      THROW_CHECK_EQ(image.descriptors->data.size(),
-                     features.descriptors_data.size() * sizeof(float));
-      std::memcpy(features.descriptors_data.data(),
-                  reinterpret_cast<const void*>(image.descriptors->data.data()),
-                  image.descriptors->data.size());
+      features.descriptors = image.descriptors;
     } else {
       // SIFT descriptors: stored as uint8, cast to float32 and root-normalize.
       const int descriptor_dim = image.descriptors->data.cols();
@@ -573,24 +566,7 @@ class LightGlueONNXFeatureMatcher : public FeatureMatcher {
       L1RootNormalizeFeatureDescriptors(&descriptors_float.data);
 
       features.descriptors_shape = {1, num_keypoints, descriptor_dim};
-      features.descriptors_data.resize(num_keypoints * descriptor_dim);
-      THROW_CHECK_EQ(descriptors_float.data.size(),
-                     features.descriptors_data.size());
-      std::memcpy(features.descriptors_data.data(),
-                  reinterpret_cast<const void*>(descriptors_float.data.data()),
-                  descriptors_float.data.size());
-
-      // Extract scale and orientation from keypoints.
-      features.scales_shape = {1, num_keypoints};
-      features.scales_data.resize(num_keypoints);
-      features.orientations_shape = {1, num_keypoints};
-      features.orientations_data.resize(num_keypoints);
-      for (int i = 0; i < num_keypoints; ++i) {
-        const FeatureKeypoint& kp = (*keypoints_to_use)[i];
-        features.scales_data[i] = kp.ComputeScale();
-        // LightGlue was trained with radians.
-        features.orientations_data[i] = kp.ComputeOrientation();
-      }
+      features.converted_descriptors_data = std::move(descriptors_float.data);
     }
 
     // Image size as (width, height).
@@ -601,6 +577,27 @@ class LightGlueONNXFeatureMatcher : public FeatureMatcher {
         static_cast<float>(swap_dims ? image_width : image_height);
 
     return features;
+  }
+
+  Ort::Value CreateDescriptorTensor(CachedFeatures& features) {
+    void* data = nullptr;
+    size_t num_bytes = 0;
+    if (features.descriptors != nullptr) {
+      const FeatureDescriptorsData& descriptors = features.descriptors->data;
+      data = const_cast<uint8_t*>(descriptors.data());
+      num_bytes = descriptors.size();
+    } else {
+      data = features.converted_descriptors_data.data();
+      num_bytes = features.converted_descriptors_data.size() * sizeof(float);
+    }
+    return Ort::Value::CreateTensor(
+        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtDeviceAllocator,
+                                   OrtMemType::OrtMemTypeCPU),
+        data,
+        num_bytes,
+        features.descriptors_shape.data(),
+        features.descriptors_shape.size(),
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
   }
 
   const FeatureMatchingOptions options_;

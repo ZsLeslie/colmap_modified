@@ -52,69 +52,37 @@ const std::string& GetExtractorModelPath(
   }
 }
 
-// Convert bitmap to row-major [C, H, W] float tensor, normalized to [0, 1].
-std::vector<float> BitmapToInputTensor(const Bitmap& bitmap) {
+// Convert a bitmap directly to a padded row-major [C, H, W] float tensor,
+// normalized to [0, 1]. Writing the padded tensor directly avoids keeping an
+// additional unpadded float image alive during inference.
+std::vector<float> BitmapToInputTensor(const Bitmap& bitmap,
+                                       const int padded_height,
+                                       const int padded_width) {
   THROW_CHECK(bitmap.IsRGB());
 
   const int width = bitmap.Width();
   const int height = bitmap.Height();
   const int pitch = bitmap.Pitch();
-  const int num_pixels = width * height;
+  THROW_CHECK_GE(padded_height, height);
+  THROW_CHECK_GE(padded_width, width);
 
-  std::vector<float> input(num_pixels * 3);
+  const int plane_size = padded_height * padded_width;
+  std::vector<float> input(plane_size * 3);
   const std::vector<uint8_t>& data = bitmap.RowMajorData();
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      for (int c = 0; c < 3; ++c) {
+  for (int c = 0; c < 3; ++c) {
+    for (int y = 0; y < padded_height; ++y) {
+      const int src_y = std::min(y, height - 1);
+      for (int x = 0; x < padded_width; ++x) {
+        const int src_x = std::min(x, width - 1);
         constexpr float kImageNormalization = 1.0f / 255.0f;
-        input[c * num_pixels + y * width + x] =
-            kImageNormalization * data[y * pitch + 3 * x + c];
+        input[c * plane_size + y * padded_width + x] =
+            kImageNormalization * data[src_y * pitch + 3 * src_x + c];
       }
     }
   }
 
   return input;
 }
-
-// Pads image dimensions to be divisible by a given factor.
-struct InputPadder {
-  InputPadder(int height, int width, int divisor = 32)
-      : original_height(height),
-        original_width(width),
-        padded_height(((height + divisor - 1) / divisor) * divisor),
-        padded_width(((width + divisor - 1) / divisor) * divisor) {}
-
-  const int original_height;
-  const int original_width;
-  const int padded_height;
-  const int padded_width;
-
-  // Pad a [C, H, W] float array by replicating edge pixels on the right and
-  // bottom of the multi-channel image. Either returns a reference to the
-  // input, if no padding is necessary, or a reference to the padded data.
-  std::vector<float>* MaybePad(std::vector<float>& input, int channels) {
-    if (padded_height == original_height && padded_width == original_width) {
-      return &input;
-    }
-
-    padded_.resize(channels * padded_height * padded_width, 0.0f);
-    for (int c = 0; c < channels; ++c) {
-      for (int y = 0; y < padded_height; ++y) {
-        const int src_y = std::min(y, original_height - 1);
-        for (int x = 0; x < padded_width; ++x) {
-          const int src_x = std::min(x, original_width - 1);
-          padded_[c * padded_height * padded_width + y * padded_width + x] =
-              input[c * original_height * original_width +
-                    src_y * original_width + src_x];
-        }
-      }
-    }
-    return &padded_;
-  }
-
- private:
-  std::vector<float> padded_;
-};
 
 class AlikedFeatureExtractor : public FeatureExtractor {
  public:
@@ -167,26 +135,27 @@ class AlikedFeatureExtractor : public FeatureExtractor {
 
     const int width = bitmap.Width();
     const int height = bitmap.Height();
-
-    std::vector<float> input = BitmapToInputTensor(bitmap);
-
-    // Pad image to dimensions divisible by 32.
-    InputPadder padder(height, width, /*divisor=*/32);
-    std::vector<float>* padded_input = padder.MaybePad(input, 3);
+    constexpr int kInputDivisor = 32;
+    const int padded_height =
+        ((height + kInputDivisor - 1) / kInputDivisor) * kInputDivisor;
+    const int padded_width =
+        ((width + kInputDivisor - 1) / kInputDivisor) * kInputDivisor;
+    std::vector<float> input =
+        BitmapToInputTensor(bitmap, padded_height, padded_width);
 
     // Prepare image input tensor.
     std::vector<int64_t> image_shape = model_.input_shapes()[0];
     image_shape[0] = 1;
     image_shape[1] = 3;
-    image_shape[2] = padder.padded_height;
-    image_shape[3] = padder.padded_width;
+    image_shape[2] = padded_height;
+    image_shape[3] = padded_width;
 
     std::vector<Ort::Value> input_tensors;
     input_tensors.emplace_back(Ort::Value::CreateTensor<float>(
         Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtDeviceAllocator,
                                    OrtMemType::OrtMemTypeCPU),
-        padded_input->data(),
-        padded_input->size(),
+        input.data(),
+        input.size(),
         image_shape.data(),
         image_shape.size()));
 
@@ -211,8 +180,13 @@ class AlikedFeatureExtractor : public FeatureExtractor {
         model_.input_shapes()[2].size()));
 
     // Run model inference.
-    const std::vector<Ort::Value> output_tensors = model_.Run(input_tensors);
+    std::vector<Ort::Value> output_tensors = model_.Run(input_tensors);
     THROW_CHECK_EQ(output_tensors.size(), 3);
+
+    // Inference is synchronous. Release the large image tensor before
+    // allocating the final keypoint and descriptor buffers.
+    input_tensors.clear();
+    std::vector<float>().swap(input);
 
     // Parse keypoints shape: [1, K, 2].
     const std::vector<int64_t> keypoints_shape =
@@ -246,8 +220,8 @@ class AlikedFeatureExtractor : public FeatureExtractor {
     // while COLMAP uses the top-left pixel's corner as (0, 0).
     // Filter out keypoints in the padded region (outside original image
     // bounds) and keypoints below the min_score threshold.
-    const float scale_x = 0.5f * static_cast<float>(padder.padded_width - 1);
-    const float scale_y = 0.5f * static_cast<float>(padder.padded_height - 1);
+    const float scale_x = 0.5f * static_cast<float>(padded_width - 1);
+    const float scale_y = 0.5f * static_cast<float>(padded_height - 1);
 
     // Collect valid keypoints, their pixel coordinates, and descriptor indices.
     struct ValidKeypoint {
@@ -268,6 +242,11 @@ class AlikedFeatureExtractor : public FeatureExtractor {
         valid_keypoints.push_back({px, py, i});
       }
     }
+
+    // Keypoint and score outputs are no longer needed. Do not keep them alive
+    // while copying the descriptor output into COLMAP's storage.
+    output_tensors[0] = Ort::Value(nullptr);
+    output_tensors[2] = Ort::Value(nullptr);
 
     // Populate output with valid keypoints and descriptors.
     const int num_valid = static_cast<int>(valid_keypoints.size());

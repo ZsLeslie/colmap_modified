@@ -78,10 +78,10 @@ class ONNXModel {
                          bool use_gpu,
                          const std::string& gpu_index);
 
-  Ort::Env env_;
   Ort::AllocatorWithDefaultOptions allocator_;
   Ort::SessionOptions session_options_;
   std::unique_ptr<Ort::Session> session_;
+  std::string arena_shrinkage_devices_;
   std::vector<std::vector<int64_t>> input_shapes_;
   std::vector<Ort::AllocatedStringPtr> input_name_strs_;
   std::vector<char*> input_names_;
